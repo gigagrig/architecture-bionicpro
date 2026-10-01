@@ -1,2 +1,10 @@
 /postgres-keycloak-data
 2024__yandex-architecture-sso.code-workspace
+.env
+.local/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+log/
+keycloak/yandex-provider/target/
