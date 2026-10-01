@@ -66,17 +66,32 @@ const ReportPage: React.FC = () => {
       if (response.status === 401) { setSession(null); throw new Error('Сессия истекла. Войдите снова.'); }
       if (!response.ok) throw new Error((body.detail || 'Не удалось получить отчёт') +
         (body.missing_days ? ': ' + body.missing_days.join(', ') : ''));
-      setReport(body);
-      if (!body.rows.length) setMessage('За этот период у вас нет зарегистрированных протезов.');
+      const file = await api(body.download_url);
+      if (file.status === 401) { setSession(null); throw new Error('Сессия истекла. Войдите снова.'); }
+      if (!file.ok) throw new Error('Не удалось загрузить отчёт. Запросите его снова.');
+      const contents = await file.json();
+      setReport(contents);
+      if (!contents.rows.length) setMessage('За этот период у вас нет зарегистрированных протезов.');
     } catch (error) { setMessage(error instanceof Error ? error.message : 'Ошибка запроса'); }
     finally { setBusy(false); }
   };
-  const download = () => {
+  const download = async () => {
     if (!report) return;
-    const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }));
-    const link = document.createElement('a');
-    link.href = url; link.download = `bionicpro-report-${report.from}-${report.to}.json`;
-    link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setBusy(true); setMessage('');
+    try {
+      // Obtain a fresh short-lived link, then download the actual CDN response.
+      const linkResponse = await api('/api/reports?' + new URLSearchParams({ from: report.from, to: report.to }));
+      if (linkResponse.status === 401) { setSession(null); throw new Error('Сессия истекла. Войдите снова.'); }
+      if (!linkResponse.ok) throw new Error('Не удалось подготовить скачивание. Запросите отчёт снова.');
+      const response = await api((await linkResponse.json()).download_url);
+      if (response.status === 401) { setSession(null); throw new Error('Сессия истекла. Войдите снова.'); }
+      if (!response.ok) throw new Error('Не удалось скачать отчёт. Попробуйте снова.');
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url; link.download = `bionicpro-report-${report.from}-${report.to}.json`;
+      link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) { setMessage(error instanceof Error ? error.message : 'Ошибка скачивания'); }
+    finally { setBusy(false); }
   };
   const metric = (value: number | null) => value === null ? '—' : value.toFixed(1);
   const button = 'px-4 py-2 bg-blue-700 text-white rounded disabled:opacity-50';

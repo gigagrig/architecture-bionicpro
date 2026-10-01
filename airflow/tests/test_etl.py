@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 import pendulum
 import pytest
-from report_etl import transform, interval, publish
+from report_etl import transform, interval, publish, publish_catalog, dag
 
 START = datetime(2026, 9, 28, tzinfo=timezone.utc)
 END = START + timedelta(days=1)
@@ -55,3 +55,50 @@ def test_publish_is_last_and_requires_all_rows(monkeypatch):
         publish(ti=ti)
     assert len(writes) == 1
     assert "INSERT" not in writes[0]
+
+
+def test_catalog_is_after_commit_and_contains_only_versions(monkeypatch):
+    import json
+    import report_etl
+    periods = [dict(day="2026-09-28", batch_id="00000000-0000-0000-0000-000000000001", published_at="2026-09-29 00:00:00.000")]
+    monkeypatch.setattr(report_etl, "ch", lambda query: json.dumps({"data":periods}))
+    for key in ("S3_ENDPOINT", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET"):
+        monkeypatch.setenv(key, "test")
+    client = Mock()
+    client.get_object.return_value = {"Body":Mock(), "ETag":"old-version"}
+    monkeypatch.setattr(report_etl.boto3, "client", lambda *args, **kwargs: client)
+    publish_catalog()
+    args = client.put_object.call_args.kwargs
+    assert args["Key"] == "catalog/current.json" and args["CacheControl"] == "no-store"
+    assert args["IfMatch"] == "old-version"
+    assert json.loads(args["Body"]) == {"schema":1, "periods":periods}
+    assert dag.get_task("publish_catalog").upstream_task_ids == {"publish"}
+
+
+def test_catalog_failure_propagates_for_retry(monkeypatch):
+    import report_etl
+    monkeypatch.setattr(report_etl, "ch", lambda query: '{"data":[]}')
+    for key in ("S3_ENDPOINT", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET"):
+        monkeypatch.setenv(key, "test")
+    client = Mock()
+    client.get_object.return_value = {"Body":Mock(), "ETag":"old-version"}
+    client.put_object.side_effect = RuntimeError("S3 unavailable")
+    monkeypatch.setattr(report_etl.boto3, "client", lambda *args, **kwargs: client)
+    with pytest.raises(RuntimeError, match="S3"):
+        publish_catalog()
+
+
+def test_catalog_bootstrap_and_conflict(monkeypatch):
+    import report_etl
+    from botocore.exceptions import ClientError
+    monkeypatch.setattr(report_etl, "ch", lambda query: '{"data":[]}')
+    for key in ("S3_ENDPOINT", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET"):
+        monkeypatch.setenv(key, "test")
+    client = Mock()
+    client.get_object.side_effect = ClientError({"Error":{"Code":"NoSuchKey"}}, "GetObject")
+    monkeypatch.setattr(report_etl.boto3, "client", lambda *args, **kwargs: client)
+    publish_catalog()
+    assert client.put_object.call_args.kwargs["IfNoneMatch"] == "*"
+    client.put_object.side_effect = ClientError({"Error":{"Code":"PreconditionFailed"}}, "PutObject")
+    with pytest.raises(ClientError):
+        publish_catalog()

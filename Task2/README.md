@@ -1,5 +1,9 @@
 # Запуск отчётов BionicPRO
 
+Стенд дополнен [хранением S3 и CDN](../Task3/README.md). При переходе с уже
+подготовленной витрины опубликуйте каталог по этой инструкции; API теперь
+возвращает ссылку на файл, а интерфейс загружает его через CDN.
+
 Сервис отчётов написан на Go; Airflow использует Python для ежедневной
 подготовки витрины из учебных PostgreSQL CRM и телеметрии в ClickHouse.
 [Архитектура](architecture.md), [draw.io](bionicpro-reports.drawio),
@@ -11,6 +15,8 @@
 
 ```bash
 python3 scripts/prepare-local.py
+docker compose build minio
+docker compose build minio-init
 docker compose build
 docker compose up -d crm_db telemetry_db clickhouse keycloak bionicpro-auth frontend gateway
 docker compose --profile tools run --rm reports-seed --days 3
@@ -56,12 +62,12 @@ docker compose exec airflow-scheduler airflow dags backfill bionicpro_reports \
 Пример соответствует запуску 1 октября 2026 года. Если запускаете позже,
 замените даты на фактические три завершённых дня из вывода заполнения.
 Не запускайте несколько backfill одновременно или одновременно с повторной
-обработкой того же дня. В интерфейсе Airflow убедитесь, что обе задачи
-`build_mart` и `publish` за нужные дни имеют состояние `success`.
+обработкой того же дня. В интерфейсе Airflow убедитесь, что три задачи
+`build_mart`, `publish` и `publish_catalog` за нужные дни имеют состояние `success`.
 
 Если дневной запуск начался до заполнения источников, `build_mart` откажет
 из-за отсутствующей контрольной отметки. После заполнения откройте DAG → Grid,
-выберите этот запуск, выделите `build_mart` и `publish` и выполните Clear,
+выберите этот запуск, выделите три задачи и выполните Clear,
 чтобы разрешить повтор. Не выставляйте задачам вручную состояние Success:
 это не создаёт витрину и не публикует данные.
 
@@ -88,7 +94,8 @@ docker compose exec airflow-scheduler airflow dags test bionicpro_reports 2026-0
    Для данных 28–30 сентября укажите `2026-09-28` и `2026-10-01`.
 3. Нажмите «Получить отчёт». Таблица покажет только два протеза `user1`.
    У запасного протеза будут нули, отклик и заряд — «—».
-4. Нажмите «Скачать отчёт JSON». Скачивается тот же показанный набор данных.
+4. Нажмите «Скачать отчёт JSON». Загружается актуальная версия через CDN;
+   если ETL обновился после показа таблицы, скачанный файл отражает новые данные.
 5. Выйдите и войдите как `user2`: будет доступен только его протез.
 6. Запросите день, который не опубликован Airflow. Интерфейс покажет
    сообщение с отсутствующими днями; частичный отчёт не формируется.
@@ -139,12 +146,4 @@ docker compose exec -e PYTHONPATH=/opt/airflow/dags airflow-scheduler \
 и отсутствие данных `user1` при входе `user2`. На узком экране таблица должна
 прокручиваться горизонтально.
 
-Если для сдачи нужны снимки экрана, создайте `Task2/screenshots/` и сохраните
-`user1-report.png`, `user2-report.png`, `period-not-ready.png`, `airflow-success.png`.
-Последний снимок: Airflow → `bionicpro_reports` → Grid, два зелёных состояния
-за выбранный день. Не показывайте секреты, OTP QR-код, токены или cookie.
-Замените комментарии ниже ссылками на снимки и запишите фактический результат
-ручной проверки в [report.md](../report.md).
-
-<!-- После ручной проверки: [user1](screenshots/user1-report.png), [user2](screenshots/user2-report.png). -->
-<!-- После ручной проверки: [нет периода](screenshots/period-not-ready.png), [Airflow](screenshots/airflow-success.png). -->
+Фактический результат ручной проверки запишите в [report.md](../report.md).

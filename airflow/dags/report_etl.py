@@ -9,6 +9,9 @@ from uuid import uuid4
 import httpx
 import pendulum
 import psycopg
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
@@ -108,6 +111,28 @@ def publish(**context):
     ch("INSERT INTO reporting.report_periods", [metadata])
 
 
+def publish_catalog():
+    """Publish current versions atomically; retry repairs a failed S3 publication."""
+    client = boto3.client("s3", endpoint_url=os.environ["S3_ENDPOINT"],
+        aws_access_key_id=os.environ["S3_ACCESS_KEY"], aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+        region_name="us-east-1", config=Config(signature_version="s3v4", connect_timeout=5,
+        read_timeout=15, retries={"max_attempts":2}, s3={"addressing_style":"path"}))
+    # Read the ETag BEFORE the ClickHouse snapshot. Conditional PUT prevents a
+    # slower concurrent manual publisher replacing a newer catalog.
+    try:
+        previous = client.get_object(Bucket=os.environ["S3_BUCKET"], Key="catalog/current.json")
+        previous["Body"].close()
+        condition = {"IfMatch": previous["ETag"]}
+    except ClientError as error:
+        if error.response["Error"]["Code"] != "NoSuchKey":
+            raise
+        condition = {"IfNoneMatch": "*"}
+    periods = json.loads(ch("SELECT day, batch_id, published_at FROM reporting.report_periods FINAL ORDER BY day FORMAT JSON"))["data"]
+    client.put_object(Bucket=os.environ["S3_BUCKET"], Key="catalog/current.json",
+        Body=json.dumps({"schema":1, "periods":periods}).encode(),
+        ContentType="application/json", CacheControl="no-store", **condition)
+
+
 with DAG("bionicpro_reports", description="Daily CRM + telemetry report mart",
          start_date=pendulum.datetime(2026, 1, 1, tz="UTC"), schedule="@daily",
          catchup=False, max_active_runs=1, is_paused_upon_creation=False,
@@ -116,4 +141,5 @@ with DAG("bionicpro_reports", description="Daily CRM + telemetry report mart",
          tags=["bionicpro", "reports"]) as dag:
     build = PythonOperator(task_id="build_mart", python_callable=build_mart)
     commit = PythonOperator(task_id="publish", python_callable=publish)
-    build >> commit
+    catalog = PythonOperator(task_id="publish_catalog", python_callable=publish_catalog)
+    build >> commit >> catalog

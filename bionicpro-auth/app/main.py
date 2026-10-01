@@ -16,7 +16,7 @@ import jwt
 import psycopg
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 ORIGIN = os.environ.get("PUBLIC_ORIGIN", "https://localhost:3443").rstrip("/")
 ISSUER = ORIGIN + "/identity/realms/reports-realm"
@@ -260,6 +260,7 @@ def save_profile(session: Session) -> dict:
 @app.api_route("/auth/{action}", methods=["GET", "POST", "DELETE"])
 @app.get("/api/{action}")
 @app.get("/reports")
+@app.get("/internal/report-authorize")
 def protected(request: Request, action: str = "reports"):
     # One worker, one bounded critical section: refresh and rotation are atomic.
     # Stale IDs are rejected, including concurrent requests from another tab.
@@ -308,11 +309,20 @@ def protected(request: Request, action: str = "reports"):
                 response = JSONResponse({"subject": session.subject, "roles": session.roles})
             elif path in ("/api/reports", "/reports"):
                 result = http.get(REPORTS_URL + "/reports", params=request.query_params.multi_items(),
-                                  headers={"Authorization": "Bearer " + session.access})
+                                  headers={"Authorization": "Bearer " + session.access}, timeout=32)
                 # Relay only report JSON, never upstream headers or tokens.
                 if result.status_code not in (200, 400, 401, 403, 409, 503):
                     raise httpx.HTTPError("Unexpected report service response")
                 response = JSONResponse(result.json(), status_code=result.status_code)
+            elif path == "/internal/report-authorize":
+                result = http.get(REPORTS_URL + "/cdn-authorize", headers={
+                    "Authorization": "Bearer " + session.access,
+                    "X-Original-URI": request.headers.get("x-original-uri", "")})
+                if result.status_code not in (204, 401, 403, 503):
+                    raise httpx.HTTPError("Unexpected download authorization response")
+                response = Response(status_code=result.status_code)
+                if result.status_code == 204:
+                    response.headers["X-Report-Origin"] = result.headers["X-Report-Origin"]
             else:
                 response = JSONResponse({"detail": "Не найдено"}, status_code=404)
         except (httpx.HTTPError, psycopg.Error):

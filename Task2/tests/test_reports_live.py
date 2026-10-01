@@ -39,6 +39,12 @@ def process_day(day):
                        stderr=subprocess.STDOUT, check=True, timeout=180, cwd=ROOT)
 
 
+def fetch_report(client, period, endpoint="/api/reports"):
+    link = client.get(endpoint, params=period)
+    assert link.status_code == 200, link.text
+    return client.get(link.json()["download_url"])
+
+
 def test_reports_are_private_complete_and_repeatable(browser, admin, user):
     other = "reports-other-" + secrets.token_hex(5)
     password = secrets.token_urlsafe(24)
@@ -70,7 +76,7 @@ def test_reports_are_private_complete_and_repeatable(browser, admin, user):
         assert browser.get("/reports", params=period).status_code == 401
         process_day(start.date().isoformat())
         login_with_setup(browser, user[0], user[1])
-        first = browser.get("/api/reports", params=period)
+        first = fetch_report(browser, period)
         assert first.status_code == 200, first.text
         rows = first.json()["rows"]
         assert {r["prosthesis_id"] for r in rows} == set(devices[:2])
@@ -80,20 +86,20 @@ def test_reports_are_private_complete_and_repeatable(browser, admin, user):
         assert spare["samples"] == 0 and spare["avg_response_ms"] is None
         assert browser.get("/api/reports", params={**period, "user_id":other_id}).status_code == 400
         assert browser.get("/api/reports", params={**period, "subject":other_id}).status_code == 400
-        assert browser.get("/reports", params=period).json()["rows"] == rows
+        assert fetch_report(browser, period, "/reports").json()["rows"] == rows
         unavailable = browser.get("/api/reports", params={"from":start.date().isoformat(), "to":(end + timedelta(days=1)).date().isoformat()})
         assert unavailable.status_code == 409
         assert end.date().isoformat() in unavailable.json()["missing_days"]
         gap = browser.get("/api/reports", params={"from":"2026-01-01", "to":"2026-01-03"})
         assert gap.status_code == 409
         process_day(start.date().isoformat())
-        repeat = browser.get("/api/reports", params=period)
+        repeat = fetch_report(browser, period)
         assert repeat.status_code == 200 and repeat.json()["rows"] == rows
         assert repeat.json()["periods"][0]["batch_id"] != first.json()["periods"][0]["batch_id"]
         context = ssl.create_default_context(cafile=str(ROOT / ".local/tls/localhost.crt"))
         with httpx.Client(base_url=ORIGIN, verify=context, follow_redirects=False, timeout=20) as other_browser:
             login_with_setup(other_browser, other, password)
-            response = other_browser.get("/api/reports", params=period)
+            response = fetch_report(other_browser, period)
             assert response.status_code == 200
             assert len(response.json()["rows"]) == 1
             assert response.json()["rows"][0]["prosthesis_id"] == devices[2]

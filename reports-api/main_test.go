@@ -32,14 +32,6 @@ func fixture(t *testing.T, missing bool) (*server, func(jwt.MapClaims, jwt.Signi
 	calls := new(int)
 	db := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		(*calls)++
-		if *calls%2 == 1 || missing {
-			if missing {
-				_, _ = w.Write([]byte(`{"data":[{"day":"2026-09-28","batch_id":"00000000-0000-0000-0000-000000000001"},{"day":"2026-09-30","batch_id":"00000000-0000-0000-0000-000000000003"}]}`))
-			} else {
-				_, _ = w.Write([]byte(`{"data":[{"day":"2026-09-28","batch_id":"00000000-0000-0000-0000-000000000001"},{"day":"2026-09-29","batch_id":"00000000-0000-0000-0000-000000000002"}]}`))
-			}
-			return
-		}
 		if r.URL.Query().Get("param_subject") != "owner-a" {
 			t.Error("query not scoped to signed subject")
 		}
@@ -67,6 +59,13 @@ func fixture(t *testing.T, missing bool) (*server, func(jwt.MapClaims, jwt.Signi
 		}
 		return value
 	}
+	catalog := []period{{Day: "2026-09-28", Batch: "00000000-0000-0000-0000-000000000001"}, {Day: "2026-09-29", Batch: "00000000-0000-0000-0000-000000000002"}}
+	if missing {
+		catalog[1] = period{Day: "2026-09-30", Batch: "00000000-0000-0000-0000-000000000003"}
+	}
+	s.store = &memoryStore{periods: catalog, objects: map[string][]byte{}}
+	s.linkKey = []byte("test-private-link-secret")
+	s.slots = make(chan struct{}, 8)
 	return s, sign, calls
 }
 
@@ -120,7 +119,7 @@ func TestTokenValidation(t *testing.T) {
 func TestOwnerAndPinnedBatches(t *testing.T) {
 	s, sign, calls := fixture(t, false)
 	got := request(s, sign(nil, jwt.SigningMethodRS256), "from=2026-09-28&to=2026-09-30")
-	if got.Code != 200 || !strings.Contains(got.Body.String(), `"prosthesis_id":"mine"`) || *calls != 2 {
+	if got.Code != 200 || !strings.Contains(got.Body.String(), `"download_url":"/cdn/`) || *calls != 1 {
 		t.Fatalf("status=%d body=%s calls=%d", got.Code, got.Body, *calls)
 	}
 	if got.Header().Get("Cache-Control") != "no-store" {
@@ -131,7 +130,7 @@ func TestOwnerAndPinnedBatches(t *testing.T) {
 func TestGapRefusesPartialReport(t *testing.T) {
 	s, sign, calls := fixture(t, true)
 	got := request(s, sign(nil, jwt.SigningMethodRS256), "from=2026-09-28&to=2026-10-01")
-	if got.Code != 409 || !strings.Contains(got.Body.String(), "2026-09-29") || *calls != 1 {
+	if got.Code != 409 || !strings.Contains(got.Body.String(), "2026-09-29") || *calls != 0 {
 		t.Fatalf("%d %s", got.Code, got.Body)
 	}
 }

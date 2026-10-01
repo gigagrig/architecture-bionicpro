@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/sync/singleflight"
 )
 
 type claims struct {
@@ -156,8 +157,12 @@ type row struct {
 	MinBattery  *float64 `json:"min_battery_pct"`
 }
 type server struct {
-	auth *verifier
-	db   *clickhouse
+	auth    *verifier
+	db      *clickhouse
+	store   reportStore
+	linkKey []byte
+	flights singleflight.Group
+	slots   chan struct{}
 }
 
 func respond(w http.ResponseWriter, status int, body any) {
@@ -169,6 +174,9 @@ func respond(w http.ResponseWriter, status int, body any) {
 }
 
 func (s *server) reports(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
 	subject, err := s.auth.subject(r)
 	if err != nil {
 		respond(w, 401, map[string]string{"detail": "Требуется вход"})
@@ -199,8 +207,7 @@ func (s *server) reports(w http.ResponseWriter, r *http.Request) {
 	var ready struct {
 		Data []period `json:"data"`
 	}
-	err = s.db.query(r.Context(), `SELECT day, batch_id, published_at FROM reporting.report_periods FINAL
-		WHERE day >= {from:Date} AND day < {to:Date} ORDER BY day`, params, &ready)
+	ready.Data, err = s.store.catalog(r.Context())
 	if err != nil {
 		respond(w, 503, map[string]string{"detail": "Хранилище отчётов временно недоступно"})
 		return
@@ -209,10 +216,12 @@ func (s *server) reports(w http.ResponseWriter, r *http.Request) {
 	for _, p := range ready.Data {
 		byDay[p.Day] = p
 	}
+	selected := []period{}
 	missing, batches := []string{}, []string{}
 	for d := start; d.Before(end); d = d.AddDate(0, 0, 1) {
 		if p, ok := byDay[d.Format("2006-01-02")]; ok {
 			batches = append(batches, p.Batch)
+			selected = append(selected, p)
 		} else {
 			missing = append(missing, d.Format("2006-01-02"))
 		}
@@ -227,21 +236,15 @@ func (s *server) reports(w http.ResponseWriter, r *http.Request) {
 	// Values come from UUID columns and still pass through the typed parameter parser.
 	params.Set("batches", "['"+strings.Join(batches, "','")+"']")
 	params.Set("subject", subject)
-	var data struct {
-		Data []row `json:"data"`
-	}
-	err = s.db.query(r.Context(), `SELECT day, prosthesis_id, model, samples, movements, errors,
-		avg_response_ms, max_response_ms, min_battery_pct FROM reporting.report_mart
-		WHERE subject = {subject:String} AND day >= {from:Date} AND day < {to:Date}
-		AND batch_id IN {batches:Array(UUID)} ORDER BY day, prosthesis_id`, params, &data)
+	key := s.objectKey(subject, q.Get("from"), q.Get("to"), selected)
+	err = s.ensureReport(r.Context(), key, params, selected)
 	if err != nil {
 		respond(w, 503, map[string]string{"detail": "Хранилище отчётов временно недоступно"})
 		return
 	}
-	if data.Data == nil {
-		data.Data = []row{}
-	}
-	respond(w, 200, map[string]any{"from": q.Get("from"), "to": q.Get("to"), "timezone": "UTC", "periods": ready.Data, "rows": data.Data})
+	expires := time.Now().Add(5 * time.Minute).Unix()
+	respond(w, 200, map[string]any{"from": q.Get("from"), "to": q.Get("to"), "timezone": "UTC",
+		"download_url": s.downloadURL(key, expires), "expires_at": expires})
 }
 
 func required(name string) string {
@@ -254,12 +257,18 @@ func required(name string) string {
 
 func main() {
 	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	storage, err := newS3Store(required("S3_ENDPOINT"), required("S3_ACCESS_KEY"), required("S3_SECRET_KEY"), required("S3_BUCKET"))
+	if err != nil {
+		log.Fatal("Invalid S3 configuration")
+	}
 	s := &server{auth: &verifier{issuer: required("OIDC_ISSUER"), jwksURL: required("OIDC_JWKS_URL"), client: client},
-		db: &clickhouse{endpoint: required("CLICKHOUSE_URL"), user: "reports_api", password: required("CLICKHOUSE_REPORTS_PASSWORD"), client: client}}
+		db:    &clickhouse{endpoint: required("CLICKHOUSE_URL"), user: "reports_api", password: required("CLICKHOUSE_REPORTS_PASSWORD"), client: client},
+		store: storage, linkKey: []byte(required("REPORT_LINK_KEY")), slots: make(chan struct{}, 8)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/reports", s.reports)
+	mux.HandleFunc("/cdn-authorize", s.authorizeDownload)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { respond(w, 200, map[string]string{"status": "ok"}) })
-	httpServer := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 25 * time.Second, IdleTimeout: 60 * time.Second}
+	httpServer := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 35 * time.Second, IdleTimeout: 60 * time.Second}
 	log.Print("reports-api listening on :8080")
 	log.Fatal(httpServer.ListenAndServe())
 }
