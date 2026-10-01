@@ -1,6 +1,161 @@
 name: bionicpro-task1
 
+x-airflow: &airflow
+  build: ./airflow
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:?Run scripts/prepare-local.py}@airflow_db:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?Run scripts/prepare-local.py}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET:?Run scripts/prepare-local.py}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: utc
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+    CRM_DATABASE_URL: postgresql://crm:${CRM_DB_PASSWORD:?Run scripts/prepare-local.py}@crm_db:5432/crm
+    TELEMETRY_DATABASE_URL: postgresql://telemetry:${TELEMETRY_DB_PASSWORD:?Run scripts/prepare-local.py}@telemetry_db:5432/telemetry
+    CLICKHOUSE_URL: http://clickhouse:8123
+    CLICKHOUSE_ETL_PASSWORD: ${CLICKHOUSE_ETL_PASSWORD:?Run scripts/prepare-local.py}
+  volumes:
+    - airflow-logs:/opt/airflow/logs
+  networks: [analytics]
+
 services:
+  crm_db:
+    image: postgres:17.6
+    environment:
+      POSTGRES_DB: crm
+      POSTGRES_USER: crm
+      POSTGRES_PASSWORD: ${CRM_DB_PASSWORD:?Run scripts/prepare-local.py}
+    volumes:
+      - crm-data:/var/lib/postgresql/data
+      - ./sources/crm.sql:/docker-entrypoint-initdb.d/crm.sql:ro
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U crm]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [analytics]
+  telemetry_db:
+    image: postgres:17.6
+    environment:
+      POSTGRES_DB: telemetry
+      POSTGRES_USER: telemetry
+      POSTGRES_PASSWORD: ${TELEMETRY_DB_PASSWORD:?Run scripts/prepare-local.py}
+    volumes:
+      - telemetry-data:/var/lib/postgresql/data
+      - ./sources/telemetry.sql:/docker-entrypoint-initdb.d/telemetry.sql:ro
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U telemetry]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [analytics]
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.3.6.56-alpine
+    environment:
+      CLICKHOUSE_USER: etl
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ETL_PASSWORD:?Run scripts/prepare-local.py}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      CLICKHOUSE_REPORTS_PASSWORD: ${CLICKHOUSE_REPORTS_PASSWORD:?Run scripts/prepare-local.py}
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/reporting.sql:ro
+      - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/reports.xml:ro
+    healthcheck:
+      test: [CMD-SHELL, "wget -q -O - http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [analytics]
+  airflow_db:
+    image: postgres:17.6
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:?Run scripts/prepare-local.py}
+    volumes:
+      - airflow-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U airflow]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [analytics]
+  airflow-init:
+    <<: *airflow
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?Run scripts/prepare-local.py}
+    command: version
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+  airflow-scheduler:
+    <<: *airflow
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      crm_db:
+        condition: service_healthy
+      telemetry_db:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD-SHELL, 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 15s
+      timeout: 10s
+      start_period: 30s
+      retries: 20
+  airflow-webserver:
+    <<: *airflow
+    command: webserver
+    ports:
+      - "127.0.0.1:8085:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD-SHELL, "curl --fail --silent http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      start_period: 30s
+      retries: 20
+  reports-seed:
+    <<: *airflow
+    profiles: [tools]
+    environment:
+      <<: *airflow-env
+      KEYCLOAK_INTERNAL_ROOT: http://keycloak:8080/identity
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+    entrypoint: [python, /opt/airflow/seed_demo.py]
+    networks: [analytics, edge]
+    depends_on:
+      crm_db:
+        condition: service_healthy
+      telemetry_db:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+  reports-api:
+    build: ./reports-api
+    environment:
+      OIDC_ISSUER: ${PUBLIC_ORIGIN:-https://localhost:3443}/identity/realms/reports-realm
+      OIDC_JWKS_URL: http://keycloak:8080/identity/realms/reports-realm/protocol/openid-connect/certs
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_REPORTS_PASSWORD: ${CLICKHOUSE_REPORTS_PASSWORD:?Run scripts/prepare-local.py}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [reports, analytics, identity]
   keycloak_db:
     image: postgres:17.6
     environment:
@@ -91,6 +246,7 @@ services:
       TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?Run scripts/prepare-local.py}
       PROFILE_DATABASE_URL: postgresql://profiles:${PROFILE_DB_PASSWORD}@profile_db:5432/profiles
       YANDEX_ENABLED: ${YANDEX_ENABLED:-false}
+      REPORTS_URL: http://reports-api:8080
     depends_on:
       profile_db:
         condition: service_healthy
@@ -99,7 +255,7 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    networks: [edge, profiles]
+    networks: [edge, profiles, reports]
   frontend:
     build: ./frontend
     networks: [edge]
@@ -124,9 +280,18 @@ volumes:
   profile-data:
   ldap-data:
   ldap-config:
+  crm-data:
+  telemetry-data:
+  clickhouse-data:
+  airflow-data:
+  airflow-logs:
 networks:
   edge:
   identity:
     internal: true
   profiles:
+    internal: true
+  reports:
+    internal: true
+  analytics:
     internal: true

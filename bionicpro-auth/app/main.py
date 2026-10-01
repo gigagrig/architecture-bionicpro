@@ -26,6 +26,7 @@ SECRET = os.environ["AUTH_CLIENT_SECRET"]
 CIPHER = Fernet(os.environ["TOKEN_ENCRYPTION_KEY"].encode())
 DATABASE = os.environ["PROFILE_DATABASE_URL"]
 YANDEX_ENABLED = os.environ.get("YANDEX_ENABLED", "false").lower() == "true"
+REPORTS_URL = os.environ.get("REPORTS_URL", "http://reports-api:8080")
 COOKIE = "__Host-bionicpro-session"
 LOGIN_COOKIE = "__Host-bionicpro-login"
 IDLE = 1800
@@ -258,7 +259,8 @@ def save_profile(session: Session) -> dict:
 
 @app.api_route("/auth/{action}", methods=["GET", "POST", "DELETE"])
 @app.get("/api/{action}")
-def protected(request: Request, action: str):
+@app.get("/reports")
+def protected(request: Request, action: str = "reports"):
     # One worker, one bounded critical section: refresh and rotation are atomic.
     # Stale IDs are rejected, including concurrent requests from another tab.
     with lock:
@@ -304,8 +306,13 @@ def protected(request: Request, action: str):
                 return response
             elif path == "/api/protected":
                 response = JSONResponse({"subject": session.subject, "roles": session.roles})
-            elif path == "/api/reports":
-                response = JSONResponse({"detail": "Сервис отчётов реализуется в задании 2"}, status_code=501)
+            elif path in ("/api/reports", "/reports"):
+                result = http.get(REPORTS_URL + "/reports", params=request.query_params.multi_items(),
+                                  headers={"Authorization": "Bearer " + session.access})
+                # Relay only report JSON, never upstream headers or tokens.
+                if result.status_code not in (200, 400, 401, 403, 409, 503):
+                    raise httpx.HTTPError("Unexpected report service response")
+                response = JSONResponse(result.json(), status_code=result.status_code)
             else:
                 response = JSONResponse({"detail": "Не найдено"}, status_code=404)
         except (httpx.HTTPError, psycopg.Error):

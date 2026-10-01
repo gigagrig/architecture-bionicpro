@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare local secrets and a TLS certificate without overwriting existing files."""
+"""Prepare TLS and add missing local secrets while preserving existing values."""
 
 import argparse
 import base64
@@ -11,9 +11,16 @@ import subprocess
 import time
 
 
+class ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage()
+        print(f"Ошибка аргументов: {message}")
+        raise SystemExit(2)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Создать .env и сертификат HTTPS/LDAPS для локального стенда. Существующие файлы сохраняются.",
-                                     epilog="Пример: python3 scripts/prepare-local.py --root .\nВыход: .env, .local/tls/*, log/openssl_*.log. Код 0 — успех, 1 — ошибка.")
+    parser = ArgumentParser(description="Создать TLS-сертификат и добавить недостающие секреты заданий 1–2 в .env. Существующие значения и сертификаты сохраняются.",
+                            epilog="Пример: python3 scripts/prepare-local.py --root .\nВыход: .env, .local/tls/*, log/openssl_*.log. Коды: 0 — успех, 1 — ошибка подготовки, 2 — ошибка аргументов.")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1], help="Корень репозитория")
     parser.add_argument("--logs-dir", type=Path, default=Path("log"), help="Каталог журналов внешних команд (по умолчанию log)")
     args = parser.parse_args()
@@ -35,6 +42,18 @@ def main() -> int:
             print(f"Создан {env} (0600); значения секретов не выводятся")
         else:
             print(f"Сохранён существующий {env}")
+        existing = {line.split("=", 1)[0] for line in env.read_text().splitlines() if "=" in line}
+        additions = {name: secrets.token_urlsafe(36) for name in (
+            "CRM_DB_PASSWORD", "TELEMETRY_DB_PASSWORD", "AIRFLOW_DB_PASSWORD",
+            "AIRFLOW_ADMIN_PASSWORD", "CLICKHOUSE_ETL_PASSWORD", "CLICKHOUSE_REPORTS_PASSWORD",
+            "AIRFLOW_WEBSERVER_SECRET") if name not in existing}
+        if "AIRFLOW_FERNET_KEY" not in existing:
+            additions["AIRFLOW_FERNET_KEY"] = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
+        if additions:
+            with env.open("a") as output:
+                output.write("\n" + "".join(f"{name}={value}\n" for name, value in additions.items()))
+            env.chmod(0o600)
+            print(f"Добавлены отсутствующие настройки задания 2 в {env}; существующие значения сохранены")
         tls = root / ".local/tls"
         if not tls.exists():
             tls.mkdir(parents=True)
