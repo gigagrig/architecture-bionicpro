@@ -25,17 +25,31 @@ def sql(service, database, query):
 
 
 def process_day(day):
+    # Wait for a post-write heartbeat from BOTH sources. The single ordered
+    # source topic then contains all earlier commits before publication starts.
+    after = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')
+    deadline = time.monotonic() + 60
+    while True:
+        query = "SELECT count() FROM reporting.cdc_state WHERE table_name='cdc_control' AND NOT deleted " \
+            f"AND parseDateTime64BestEffortOrNull(JSONExtractString(payload,'touched_at'),6,'UTC') > toDateTime64('{after}',6,'UTC')"
+        result = subprocess.run(['docker','compose','exec','-T','clickhouse','sh','-c',
+            'clickhouse-client --user etl --password "$CLICKHOUSE_PASSWORD"'],
+            input=query, text=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT)
+        if result.stdout.strip() == '2':
+            break
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Both CDC heartbeats did not arrive')
+        time.sleep(1)
     logs = ROOT / "log"
     logs.mkdir(exist_ok=True)
     log = logs / f"airflow_{time.strftime('%Y%m%d_%H%M%S')}_{day}_{os.getpid()}_{secrets.token_hex(3)}.log"
     print(f"DAG date={day}; log={log}")
     with log.open("w") as output:
-        # Manual test runs infer the previous daily interval from their timestamp.
-        # Use noon so a manual run cannot collide with a scheduled/backfill
-        # logical date at midnight in Airflow's shared metadata database.
+        # A forced day preserves the earlier daily test contract. The publication
+        # DAG is now scheduled every minute and reads ClickHouse exclusively.
         trigger = (datetime.fromisoformat(day) + timedelta(days=1, hours=12)).isoformat() + "+00:00"
         subprocess.run(["docker", "compose", "exec", "-T", "airflow-scheduler", "airflow",
-                        "dags", "test", "bionicpro_reports", trigger], stdout=output,
+                        "dags", "test", "bionicpro_reports", trigger, "--conf", '{"day":"' + day + '"}'], stdout=output,
                        stderr=subprocess.STDOUT, check=True, timeout=180, cwd=ROOT)
 
 

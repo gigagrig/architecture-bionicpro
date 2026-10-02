@@ -48,7 +48,7 @@ func newS3Store(endpoint, access, secret, bucket string) (*s3Store, error) {
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 func (s *s3Store) catalog(ctx context.Context) ([]period, error) {
-	object, err := s.client.GetObject(ctx, s.bucket, "catalog/current.json", minio.GetObjectOptions{})
+	object, err := s.client.GetObject(ctx, s.bucket, "catalog/cdc-current.json", minio.GetObjectOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +142,7 @@ func (s *server) ensureReport(ctx context.Context, key string, params url.Values
 			Data []row `json:"data"`
 		}
 		err = s.db.query(work, `SELECT day, prosthesis_id, model, samples, movements, errors,
-			avg_response_ms, max_response_ms, min_battery_pct FROM reporting.report_mart
+			avg_response_ms, max_response_ms, min_battery_pct FROM reporting.cdc_report_mart
 			WHERE subject = {subject:String} AND day >= {from:Date} AND day < {to:Date}
 			AND batch_id IN {batches:Array(UUID)} ORDER BY day, prosthesis_id`, params, &data)
 		if err != nil {

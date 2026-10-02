@@ -1,104 +1,112 @@
-"""ETL invariants: attribution by event time and refusing incomplete publication."""
-from datetime import datetime, timedelta, timezone
+"""CDC publication: complete snapshots, unchanged content, retries and private catalogs."""
+import hashlib
+import json
+from types import SimpleNamespace
 from unittest.mock import Mock
 
-import pendulum
 import pytest
-from report_etl import transform, interval, publish, publish_catalog, dag
+import report_etl
+from report_etl import commit, publish_catalog, sync_reports, dag
 
-START = datetime(2026, 9, 28, tzinfo=timezone.utc)
-END = START + timedelta(days=1)
-
-
-def test_transfer_multiple_devices_and_empty_day():
-    split = START + timedelta(hours=12)
-    owners = [("hand", "a", "model", START, split), ("hand", "b", "model", split, None),
-              ("spare", "a", "model", START, None)]
-    events = [("hand", START, 2, 80.0, 95.0, False), ("hand", split, 3, 100.0, 85.0, True)]
-    rows = {(r["subject"], r["prosthesis_id"]): r for r in transform(owners, events, START, END)}
-    assert rows[("a", "hand")]["movements"] == 2
-    assert rows[("b", "hand")]["movements"] == 3
-    assert rows[("b", "hand")]["errors"] == 1
-    assert rows[("a", "spare")]["samples"] == 0
-    assert rows[("a", "spare")]["avg_response_ms"] is None
+DAY = '2026-09-28'
+ROW = dict(subject='owner', day=DAY, prosthesis_id='hand', model='demo',
+    samples=1, movements=7, errors=0, avg_response_ms=80.0, max_response_ms=80.0, min_battery_pct=90.0)
 
 
-def test_orphan_telemetry_fails_instead_of_silent_loss():
-    with pytest.raises(ValueError, match="ownership"):
-        transform([], [("unknown", START, 1, 80.0, 99.0, False)], START, END)
+def mock_snapshot(monkeypatch, previous=None, ready=1, rows=None):
+    calls = []
+    def query(sql, rows=None, params=None):
+        calls.append(sql)
+        if 'content_hash FROM reporting.cdc_report_periods' in sql:
+            return json.dumps({'data': previous or []})
+        if 'FROM reporting.cdc_report_current' in sql:
+            data = [dict(row, row_kind='report', ready=1) for row in records]
+            data.append(dict(ROW, row_kind='period', ready=ready))
+            return json.dumps({'data': data})
+        raise AssertionError(sql)
+    records = [ROW] if rows is None else rows
+    monkeypatch.setattr(report_etl, 'ch', query)
+    monkeypatch.setattr(report_etl, 'refresh_views', Mock())
+    monkeypatch.setattr(report_etl, 'commit', Mock())
+    monkeypatch.setattr(report_etl, 'publish_catalog', Mock())
+    return calls
 
 
-def test_overlapping_ownership_fails():
-    owners = [("hand", s, "model", START, None) for s in ("a", "b")]
-    with pytest.raises(ValueError, match="ambiguous"):
-        transform(owners, [("hand", START, 1, 80.0, 99.0, False)], START, END)
+def test_incomplete_snapshot_never_publishes(monkeypatch):
+    mock_snapshot(monkeypatch, ready=0)
+    with pytest.raises(ValueError, match='not ready'):
+        sync_reports(dag_run=SimpleNamespace(conf={'day': DAY}))
+    report_etl.commit.assert_not_called()
+    report_etl.publish_catalog.assert_not_called()
 
 
-def test_interval_must_be_complete_utc_day():
-    start = pendulum.datetime(2026, 9, 28, tz="UTC")
-    assert interval(dict(data_interval_start=start, data_interval_end=start.add(days=1))) == (start, start.add(days=1))
-    with pytest.raises(ValueError):
-        interval(dict(data_interval_start=start.add(hours=1), data_interval_end=start.add(days=1)))
-    with pytest.raises(ValueError):
-        interval(dict(data_interval_start=pendulum.now("UTC").start_of("day"),
-                      data_interval_end=pendulum.now("UTC").start_of("day").add(days=1)))
+def test_new_snapshot_pins_uuid_and_metadata_without_reading_oltp(monkeypatch):
+    calls = mock_snapshot(monkeypatch)
+    result = sync_reports(dag_run=SimpleNamespace(conf={'day': DAY}))
+    assert result['published_days'] == 1
+    metadata, rows = report_etl.commit.call_args.args
+    assert metadata['day'] == DAY and metadata['row_count'] == 1
+    assert rows[0]['batch_id'] == metadata['batch_id']
+    assert len(metadata['content_hash']) == 64
+    assert all('reporting.cdc_' in sql for sql in calls)
+    report_etl.publish_catalog.assert_called_once()
+    assert dag.task_ids == ['publish_cdc'] and dag.max_active_runs == 1
 
 
-def test_publish_is_last_and_requires_all_rows(monkeypatch):
-    import report_etl
-    metadata = dict(day="2026-09-28", batch_id="00000000-0000-0000-0000-000000000001", row_count=2)
-    ti = Mock()
-    ti.xcom_pull.return_value = metadata
+def test_unchanged_data_preserves_version_and_repairs_failed_s3_publication(monkeypatch):
+    digest = hashlib.sha256(json.dumps([DAY, [ROW]], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    mock_snapshot(monkeypatch, previous=[dict(day=DAY, content_hash=digest)])
+    result = sync_reports()
+    assert result['published_days'] == 0
+    report_etl.commit.assert_not_called()
+    report_etl.publish_catalog.assert_called_once()
+
+
+def test_empty_closed_day_publishes_zero_rows(monkeypatch):
+    mock_snapshot(monkeypatch, rows=[])
+    sync_reports(dag_run=SimpleNamespace(conf={'day': DAY}))
+    metadata, rows = report_etl.commit.call_args.args
+    assert rows == [] and metadata['row_count'] == 0
+
+
+def test_partial_batch_is_never_marked_ready(monkeypatch):
     writes = []
-    monkeypatch.setattr(report_etl, "ch", lambda sql, rows=None, params=None: writes.append(sql) or "1\n")
-    with pytest.raises(ValueError, match="Incomplete"):
-        publish(ti=ti)
-    assert len(writes) == 1
-    assert "INSERT" not in writes[0]
+    monkeypatch.setattr(report_etl, 'ch', lambda sql, rows=None, params=None: writes.append(sql) or '1\n')
+    with pytest.raises(ValueError, match='Incomplete'):
+        commit(dict(batch_id='00000000-0000-0000-0000-000000000001', row_count=2), [ROW, ROW])
+    assert not any('cdc_report_periods' in sql for sql in writes)
 
 
-def test_catalog_is_after_commit_and_contains_only_versions(monkeypatch):
-    import json
-    import report_etl
-    periods = [dict(day="2026-09-28", batch_id="00000000-0000-0000-0000-000000000001", published_at="2026-09-29 00:00:00.000")]
-    monkeypatch.setattr(report_etl, "ch", lambda query: json.dumps({"data":periods}))
-    for key in ("S3_ENDPOINT", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET"):
-        monkeypatch.setenv(key, "test")
+def catalog_client(monkeypatch):
+    for key in ('S3_ENDPOINT', 'S3_ACCESS_KEY', 'S3_SECRET_KEY', 'S3_BUCKET'):
+        monkeypatch.setenv(key, 'test')
     client = Mock()
-    client.get_object.return_value = {"Body":Mock(), "ETag":"old-version"}
-    monkeypatch.setattr(report_etl.boto3, "client", lambda *args, **kwargs: client)
+    client.get_object.return_value = {'Body': Mock(), 'ETag': 'old-version'}
+    monkeypatch.setattr(report_etl.boto3, 'client', lambda *args, **kwargs: client)
+    return client
+
+
+def test_catalog_contains_only_cdc_versions_and_uses_conditional_put(monkeypatch):
+    periods = [dict(day=DAY, batch_id='00000000-0000-0000-0000-000000000001', published_at='2026-09-29 00:00:00.000')]
+    def query(sql):
+        assert 'cdc_report_periods FINAL' in sql
+        return json.dumps({'data': periods})
+    monkeypatch.setattr(report_etl, 'ch', query)
+    client = catalog_client(monkeypatch)
     publish_catalog()
     args = client.put_object.call_args.kwargs
-    assert args["Key"] == "catalog/current.json" and args["CacheControl"] == "no-store"
-    assert args["IfMatch"] == "old-version"
-    assert json.loads(args["Body"]) == {"schema":1, "periods":periods}
-    assert dag.get_task("publish_catalog").upstream_task_ids == {"publish"}
+    assert args['Key'] == 'catalog/cdc-current.json' and args['CacheControl'] == 'no-store'
+    assert args['IfMatch'] == 'old-version'
+    assert json.loads(args['Body']) == {'schema': 1, 'periods': periods}
 
 
-def test_catalog_failure_propagates_for_retry(monkeypatch):
-    import report_etl
-    monkeypatch.setattr(report_etl, "ch", lambda query: '{"data":[]}')
-    for key in ("S3_ENDPOINT", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET"):
-        monkeypatch.setenv(key, "test")
-    client = Mock()
-    client.get_object.return_value = {"Body":Mock(), "ETag":"old-version"}
-    client.put_object.side_effect = RuntimeError("S3 unavailable")
-    monkeypatch.setattr(report_etl.boto3, "client", lambda *args, **kwargs: client)
-    with pytest.raises(RuntimeError, match="S3"):
-        publish_catalog()
-
-
-def test_catalog_bootstrap_and_conflict(monkeypatch):
-    import report_etl
+def test_catalog_bootstrap_conflict_and_failure_are_retried(monkeypatch):
     from botocore.exceptions import ClientError
-    monkeypatch.setattr(report_etl, "ch", lambda query: '{"data":[]}')
-    for key in ("S3_ENDPOINT", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET"):
-        monkeypatch.setenv(key, "test")
-    client = Mock()
-    client.get_object.side_effect = ClientError({"Error":{"Code":"NoSuchKey"}}, "GetObject")
-    monkeypatch.setattr(report_etl.boto3, "client", lambda *args, **kwargs: client)
+    monkeypatch.setattr(report_etl, 'ch', lambda sql: '{"data":[]}')
+    client = catalog_client(monkeypatch)
+    client.get_object.side_effect = ClientError({'Error': {'Code': 'NoSuchKey'}}, 'GetObject')
     publish_catalog()
-    assert client.put_object.call_args.kwargs["IfNoneMatch"] == "*"
-    client.put_object.side_effect = ClientError({"Error":{"Code":"PreconditionFailed"}}, "PutObject")
+    assert client.put_object.call_args.kwargs['IfNoneMatch'] == '*'
+    client.put_object.side_effect = ClientError({'Error': {'Code': 'PreconditionFailed'}}, 'PutObject')
     with pytest.raises(ClientError):
         publish_catalog()

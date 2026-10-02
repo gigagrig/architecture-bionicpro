@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +33,10 @@ func fixture(t *testing.T, missing bool) (*server, func(jwt.MapClaims, jwt.Signi
 	calls := new(int)
 	db := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		(*calls)++
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), "FROM reporting.cdc_report_mart") {
+			t.Error("API must read the CDC mart")
+		}
 		if r.URL.Query().Get("param_subject") != "owner-a" {
 			t.Error("query not scoped to signed subject")
 		}

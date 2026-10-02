@@ -10,8 +10,6 @@ x-airflow: &airflow
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DEFAULT_TIMEZONE: utc
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
-    CRM_DATABASE_URL: postgresql://crm:${CRM_DB_PASSWORD:?Run scripts/prepare-local.py}@crm_db:5432/crm
-    TELEMETRY_DATABASE_URL: postgresql://telemetry:${TELEMETRY_DB_PASSWORD:?Run scripts/prepare-local.py}@telemetry_db:5432/telemetry
     CLICKHOUSE_URL: http://clickhouse:8123
     CLICKHOUSE_ETL_PASSWORD: ${CLICKHOUSE_ETL_PASSWORD:?Run scripts/prepare-local.py}
     S3_ENDPOINT: http://minio:9000
@@ -23,6 +21,141 @@ x-airflow: &airflow
   networks: [analytics, storage]
 
 services:
+  kafka:
+    image: apache/kafka:4.0.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+      - ./debezium:/config:ro
+    healthcheck:
+      test: [CMD-SHELL, /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    networks: [cdc]
+  kafka-init:
+    image: apache/kafka:4.0.0
+    entrypoint: [bash, /config/topics.sh]
+    command: [--logs-dir, /tmp/log]
+    volumes:
+      - ./debezium:/config:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks: [cdc]
+  kafka-connect:
+    image: quay.io/debezium/connect:3.2.1.Final
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: bionicpro-connect
+      CONFIG_STORAGE_TOPIC: connect-configs
+      OFFSET_STORAGE_TOPIC: connect-offsets
+      STATUS_STORAGE_TOPIC: connect-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PRODUCER_MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION: 1
+      CONNECT_PRODUCER_ACKS: all
+      CONNECT_PRODUCER_ENABLE_IDEMPOTENCE: "true"
+      CONNECT_CONFIG_PROVIDERS: env
+      CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+      CRM_CDC_PASSWORD: ${CRM_CDC_PASSWORD:?Run scripts/prepare-local.py}
+      TELEMETRY_CDC_PASSWORD: ${TELEMETRY_CDC_PASSWORD:?Run scripts/prepare-local.py}
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    healthcheck:
+      test: [CMD-SHELL, curl --fail --silent http://localhost:8083/connectors >/dev/null]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      crm-cdc-init:
+        condition: service_completed_successfully
+      telemetry-cdc-init:
+        condition: service_completed_successfully
+    networks: [cdc, crm-source, telemetry-source]
+  debezium-init:
+    image: python:3.12.11-alpine
+    entrypoint: [python, /config/register.py]
+    volumes:
+      - ./debezium:/config:ro
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+      cdc-schema:
+        condition: service_completed_successfully
+    networks: [cdc]
+  crm-cdc-init:
+    image: postgres:17.6
+    entrypoint: [bash, /config/prepare-source.sh]
+    command: [--logs-dir, /tmp/log]
+    environment:
+      PGHOST: crm_db
+      PGUSER: crm
+      PGDATABASE: crm
+      PGPASSWORD: ${CRM_DB_PASSWORD}
+      CDC_PASSWORD: ${CRM_CDC_PASSWORD:?Run scripts/prepare-local.py}
+      CDC_SOURCE: crm
+    volumes:
+      - ./debezium:/config:ro
+    depends_on:
+      crm_db:
+        condition: service_healthy
+    networks: [crm-source]
+  telemetry-cdc-init:
+    image: postgres:17.6
+    entrypoint: [bash, /config/prepare-source.sh]
+    command: [--logs-dir, /tmp/log]
+    environment:
+      PGHOST: telemetry_db
+      PGUSER: telemetry
+      PGDATABASE: telemetry
+      PGPASSWORD: ${TELEMETRY_DB_PASSWORD}
+      CDC_PASSWORD: ${TELEMETRY_CDC_PASSWORD:?Run scripts/prepare-local.py}
+      CDC_SOURCE: telemetry
+    volumes:
+      - ./debezium:/config:ro
+    depends_on:
+      telemetry_db:
+        condition: service_healthy
+    networks: [telemetry-source]
+  cdc-schema:
+    image: clickhouse/clickhouse-server:25.3.6.56-alpine
+    entrypoint: [bash, /config/apply-schema.sh]
+    command: [--logs-dir, /tmp/log]
+    environment:
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ETL_PASSWORD}
+    volumes:
+      - ./debezium:/config:ro
+      - ./clickhouse:/schema:ro
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    networks: [analytics]
   minio:
     build:
       context: ./minio
@@ -73,6 +206,7 @@ services:
     networks: [edge, reports, storage]
   crm_db:
     image: postgres:17.6
+    command: [postgres, -c, wal_level=logical, -c, max_replication_slots=4, -c, max_wal_senders=4, -c, max_slot_wal_keep_size=1GB]
     environment:
       POSTGRES_DB: crm
       POSTGRES_USER: crm
@@ -85,9 +219,10 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
-    networks: [analytics]
+    networks: [crm-source]
   telemetry_db:
     image: postgres:17.6
+    command: [postgres, -c, wal_level=logical, -c, max_replication_slots=4, -c, max_wal_senders=4, -c, max_slot_wal_keep_size=1GB]
     environment:
       POSTGRES_DB: telemetry
       POSTGRES_USER: telemetry
@@ -100,7 +235,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
-    networks: [analytics]
+    networks: [telemetry-source]
   clickhouse:
     image: clickhouse/clickhouse-server:25.3.6.56-alpine
     environment:
@@ -117,7 +252,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
-    networks: [analytics]
+    networks: [analytics, cdc]
   airflow_db:
     image: postgres:17.6
     environment:
@@ -150,12 +285,10 @@ services:
     depends_on:
       airflow-init:
         condition: service_completed_successfully
-      crm_db:
-        condition: service_healthy
-      telemetry_db:
-        condition: service_healthy
       clickhouse:
         condition: service_healthy
+      debezium-init:
+        condition: service_completed_successfully
       minio-init:
         condition: service_completed_successfully
     healthcheck:
@@ -183,10 +316,12 @@ services:
     profiles: [tools]
     environment:
       <<: *airflow-env
+      CRM_DATABASE_URL: postgresql://crm:${CRM_DB_PASSWORD}@crm_db:5432/crm
+      TELEMETRY_DATABASE_URL: postgresql://telemetry:${TELEMETRY_DB_PASSWORD}@telemetry_db:5432/telemetry
       KEYCLOAK_INTERNAL_ROOT: http://keycloak:8080/identity
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
     entrypoint: [python, /opt/airflow/seed_demo.py]
-    networks: [analytics, edge]
+    networks: [crm-source, telemetry-source, edge]
     depends_on:
       crm_db:
         condition: service_healthy
@@ -348,7 +483,14 @@ volumes:
   airflow-logs:
   reports-s3:
   reports-cdn-cache:
+  kafka-data:
 networks:
+  cdc:
+    internal: true
+  crm-source:
+    internal: true
+  telemetry-source:
+    internal: true
   edge:
   identity:
     internal: true
