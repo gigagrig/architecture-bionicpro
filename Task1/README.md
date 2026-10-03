@@ -5,6 +5,15 @@
 Каждое представительство имеет собственный контур учётных записей и данных;
 локальный стенд моделирует один такой контур.
 
+## Документы и реализация
+
+1. [Диаграмма архитектуры в draw.io](bionicpro-security.drawio).
+2. [Реализация PKCE flow](../bionicpro-auth/app/main.py).
+3. [Бэкенд-сервис: получение access- и refresh-токенов, создание пользовательской сессии](../bionicpro-auth/app/main.py).
+4. Фронтенд с пользовательскими сессиями: [обращения к API с cookie](../frontend/src/api.ts), [интерфейс входа и отчётов](../frontend/src/components/ReportPage.tsx).
+5. [Экспорт realm Keycloak](../keycloak/keycloak-results-export.json).
+6. OAuth 2.0 через Яндекс ID: [провайдер Keycloak](../keycloak/yandex-provider/src/main/java/ru/bionicpro/keycloak/YandexIdentityProvider.java), [обработка входа и профиля в бэкенде](../bionicpro-auth/app/main.py).
+
 ## Устройство и решения
 
 - React обращается к `bionicpro-auth` — серверной части интерфейса (BFF).

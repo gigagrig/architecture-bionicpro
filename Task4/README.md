@@ -4,6 +4,12 @@ CDC (Change Data Capture) доставляет изменения CRM и тел�
 После начального снимка Debezium читает журнал PostgreSQL, поэтому регулярная
 подготовка отчётов не выполняет массовые запросы к исходным базам.
 
+## Документы и реализация
+
+1. [Конфигурация развёртывания Kafka и Kafka Connect в Docker Compose](../docker-compose.yaml) — сервисы `kafka` и `kafka-connect`.
+2. [Конфигурация Debezium-коннектора для БД CRM](../debezium/crm-connector.json) в [каталоге debezium](../debezium/).
+3. [SQL приёма данных через KafkaEngine и создания Materialized View для витрины ClickHouse](../clickhouse/cdc.sql).
+
 ## Устройство и решения
 
 1. Два коннектора Debezium в Kafka Connect передают изменения источников
