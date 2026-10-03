@@ -1,42 +1,504 @@
-version: '3.8'
+name: bionicpro-task1
+
+x-airflow: &airflow
+  build: ./airflow
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:?Run scripts/prepare-local.py}@airflow_db:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?Run scripts/prepare-local.py}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET:?Run scripts/prepare-local.py}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: utc
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+    CLICKHOUSE_URL: http://clickhouse:8123
+    CLICKHOUSE_ETL_PASSWORD: ${CLICKHOUSE_ETL_PASSWORD:?Run scripts/prepare-local.py}
+    S3_ENDPOINT: http://minio:9000
+    S3_BUCKET: bionicpro-reports
+    S3_ACCESS_KEY: report-etl
+    S3_SECRET_KEY: ${S3_ETL_SECRET:?Run scripts/prepare-local.py}
+  volumes:
+    - airflow-logs:/opt/airflow/logs
+  networks: [analytics, storage]
 
 services:
-  keycloak_db:
-    image: postgres:14
+  kafka:
+    image: apache/kafka:4.0.0
     environment:
-      POSTGRES_DB: keycloak_db
-      POSTGRES_USER: keycloak_user
-      POSTGRES_PASSWORD: keycloak_password
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
     volumes:
-      - ./postgres-keycloak-data:/var/lib/postgresql/data
-    ports:
-      - "5433:5432"
-  keycloak:
-    image: quay.io/keycloak/keycloak:21.1
-    environment:
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
-      KC_DB: postgres
-      KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
-      KC_DB_USERNAME: keycloak_user
-      KC_DB_PASSWORD: keycloak_password
-    command: 
-      - start-dev
-      - --import-realm
+      - kafka-data:/var/lib/kafka/data
+      - ./debezium:/config:ro
+    healthcheck:
+      test: [CMD-SHELL, /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    networks: [cdc]
+  kafka-init:
+    image: apache/kafka:4.0.0
+    entrypoint: [bash, /config/topics.sh]
+    command: [--logs-dir, /tmp/log]
     volumes:
-      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
-    ports:
-      - "8080:8080"
+      - ./debezium:/config:ro
     depends_on:
-      - keycloak_db
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    ports:
-      - "3000:3000"
+      kafka:
+        condition: service_healthy
+    networks: [cdc]
+  kafka-connect:
+    image: quay.io/debezium/connect:3.2.1.Final
     environment:
-      REACT_APP_API_URL: http://localhost:8000
-      REACT_APP_KEYCLOAK_URL: http://localhost:8080
-      REACT_APP_KEYCLOAK_REALM: reports-realm
-      REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: bionicpro-connect
+      CONFIG_STORAGE_TOPIC: connect-configs
+      OFFSET_STORAGE_TOPIC: connect-offsets
+      STATUS_STORAGE_TOPIC: connect-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PRODUCER_MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION: 1
+      CONNECT_PRODUCER_ACKS: all
+      CONNECT_PRODUCER_ENABLE_IDEMPOTENCE: "true"
+      CONNECT_CONFIG_PROVIDERS: env
+      CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+      CRM_CDC_PASSWORD: ${CRM_CDC_PASSWORD:?Run scripts/prepare-local.py}
+      TELEMETRY_CDC_PASSWORD: ${TELEMETRY_CDC_PASSWORD:?Run scripts/prepare-local.py}
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    healthcheck:
+      test: [CMD-SHELL, curl --fail --silent http://localhost:8083/connectors >/dev/null]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      crm-cdc-init:
+        condition: service_completed_successfully
+      telemetry-cdc-init:
+        condition: service_completed_successfully
+    networks: [cdc, crm-source, telemetry-source]
+  debezium-init:
+    image: python:3.12.11-alpine
+    entrypoint: [python, /config/register.py]
+    volumes:
+      - ./debezium:/config:ro
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+      cdc-schema:
+        condition: service_completed_successfully
+    networks: [cdc]
+  crm-cdc-init:
+    image: postgres:17.6
+    entrypoint: [bash, /config/prepare-source.sh]
+    command: [--logs-dir, /tmp/log]
+    environment:
+      PGHOST: crm_db
+      PGUSER: crm
+      PGDATABASE: crm
+      PGPASSWORD: ${CRM_DB_PASSWORD}
+      CDC_PASSWORD: ${CRM_CDC_PASSWORD:?Run scripts/prepare-local.py}
+      CDC_SOURCE: crm
+    volumes:
+      - ./debezium:/config:ro
+    depends_on:
+      crm_db:
+        condition: service_healthy
+    networks: [crm-source]
+  telemetry-cdc-init:
+    image: postgres:17.6
+    entrypoint: [bash, /config/prepare-source.sh]
+    command: [--logs-dir, /tmp/log]
+    environment:
+      PGHOST: telemetry_db
+      PGUSER: telemetry
+      PGDATABASE: telemetry
+      PGPASSWORD: ${TELEMETRY_DB_PASSWORD}
+      CDC_PASSWORD: ${TELEMETRY_CDC_PASSWORD:?Run scripts/prepare-local.py}
+      CDC_SOURCE: telemetry
+    volumes:
+      - ./debezium:/config:ro
+    depends_on:
+      telemetry_db:
+        condition: service_healthy
+    networks: [telemetry-source]
+  cdc-schema:
+    image: clickhouse/clickhouse-server:25.3.6.56-alpine
+    entrypoint: [bash, /config/apply-schema.sh]
+    command: [--logs-dir, /tmp/log]
+    environment:
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ETL_PASSWORD}
+    volumes:
+      - ./debezium:/config:ro
+      - ./clickhouse:/schema:ro
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    networks: [analytics]
+  minio:
+    build:
+      context: ./minio
+      target: server
+    command: [server, /data, --console-address, ":9001"]
+    environment:
+      MINIO_ROOT_USER: bionicpro-root
+      MINIO_ROOT_PASSWORD: ${S3_ROOT_PASSWORD:?Run scripts/prepare-local.py}
+    volumes:
+      - reports-s3:/data
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:9000/minio/health/live]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [storage]
+  minio-init:
+    build:
+      context: ./minio
+      target: client
+    entrypoint: [bash, /init/init.sh]
+    command: [--logs-dir, /tmp/log]
+    environment:
+      S3_ROOT_PASSWORD: ${S3_ROOT_PASSWORD}
+      S3_REPORTS_SECRET: ${S3_REPORTS_SECRET:?Run scripts/prepare-local.py}
+      S3_ETL_SECRET: ${S3_ETL_SECRET:?Run scripts/prepare-local.py}
+    volumes:
+      - ./minio:/init:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks: [storage]
+  cdn:
+    image: nginx:1.28.0-alpine
+    volumes:
+      - ./nginx/cdn.conf:/etc/nginx/conf.d/default.conf:ro
+      - reports-cdn-cache:/var/cache/nginx/reports
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:8080/health]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      bionicpro-auth:
+        condition: service_started
+    networks: [edge, reports, storage]
+  crm_db:
+    image: postgres:17.6
+    command: [postgres, -c, wal_level=logical, -c, max_replication_slots=4, -c, max_wal_senders=4, -c, max_slot_wal_keep_size=1GB]
+    environment:
+      POSTGRES_DB: crm
+      POSTGRES_USER: crm
+      POSTGRES_PASSWORD: ${CRM_DB_PASSWORD:?Run scripts/prepare-local.py}
+    volumes:
+      - crm-data:/var/lib/postgresql/data
+      - ./sources/crm.sql:/docker-entrypoint-initdb.d/crm.sql:ro
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U crm]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [crm-source]
+  telemetry_db:
+    image: postgres:17.6
+    command: [postgres, -c, wal_level=logical, -c, max_replication_slots=4, -c, max_wal_senders=4, -c, max_slot_wal_keep_size=1GB]
+    environment:
+      POSTGRES_DB: telemetry
+      POSTGRES_USER: telemetry
+      POSTGRES_PASSWORD: ${TELEMETRY_DB_PASSWORD:?Run scripts/prepare-local.py}
+    volumes:
+      - telemetry-data:/var/lib/postgresql/data
+      - ./sources/telemetry.sql:/docker-entrypoint-initdb.d/telemetry.sql:ro
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U telemetry]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [telemetry-source]
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.3.6.56-alpine
+    environment:
+      CLICKHOUSE_USER: etl
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ETL_PASSWORD:?Run scripts/prepare-local.py}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      CLICKHOUSE_REPORTS_PASSWORD: ${CLICKHOUSE_REPORTS_PASSWORD:?Run scripts/prepare-local.py}
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/reporting.sql:ro
+      - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/reports.xml:ro
+    healthcheck:
+      test: [CMD-SHELL, "wget -q -O - http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [analytics, cdc]
+  airflow_db:
+    image: postgres:17.6
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:?Run scripts/prepare-local.py}
+    volumes:
+      - airflow-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U airflow]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [analytics]
+  airflow-init:
+    <<: *airflow
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?Run scripts/prepare-local.py}
+    command: version
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+  airflow-scheduler:
+    <<: *airflow
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+      debezium-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD-SHELL, 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 15s
+      timeout: 10s
+      start_period: 30s
+      retries: 20
+  airflow-webserver:
+    <<: *airflow
+    command: webserver
+    ports:
+      - "127.0.0.1:8085:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD-SHELL, "curl --fail --silent http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      start_period: 30s
+      retries: 20
+  reports-seed:
+    <<: *airflow
+    profiles: [tools]
+    environment:
+      <<: *airflow-env
+      CRM_DATABASE_URL: postgresql://crm:${CRM_DB_PASSWORD}@crm_db:5432/crm
+      TELEMETRY_DATABASE_URL: postgresql://telemetry:${TELEMETRY_DB_PASSWORD}@telemetry_db:5432/telemetry
+      KEYCLOAK_INTERNAL_ROOT: http://keycloak:8080/identity
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+    entrypoint: [python, /opt/airflow/seed_demo.py]
+    networks: [crm-source, telemetry-source, edge]
+    depends_on:
+      crm_db:
+        condition: service_healthy
+      telemetry_db:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+  reports-api:
+    build: ./reports-api
+    environment:
+      OIDC_ISSUER: ${PUBLIC_ORIGIN:-https://localhost:3443}/identity/realms/reports-realm
+      OIDC_JWKS_URL: http://keycloak:8080/identity/realms/reports-realm/protocol/openid-connect/certs
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_REPORTS_PASSWORD: ${CLICKHOUSE_REPORTS_PASSWORD:?Run scripts/prepare-local.py}
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: bionicpro-reports
+      S3_ACCESS_KEY: reports-api
+      S3_SECRET_KEY: ${S3_REPORTS_SECRET:?Run scripts/prepare-local.py}
+      REPORT_LINK_KEY: ${REPORT_LINK_KEY:?Run scripts/prepare-local.py}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [reports, analytics, identity, storage]
+  keycloak_db:
+    image: postgres:17.6
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?Run scripts/prepare-local.py}
+    volumes:
+      - keycloak-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U keycloak]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [identity]
+  profile_db:
+    image: postgres:17.6
+    environment:
+      POSTGRES_DB: profiles
+      POSTGRES_USER: profiles
+      POSTGRES_PASSWORD: ${PROFILE_DB_PASSWORD:?Run scripts/prepare-local.py}
+    volumes:
+      - profile-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U profiles]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [profiles]
+  ldap:
+    image: osixia/openldap:1.5.0
+    command: --copy-service
+    environment:
+      LDAP_ORGANISATION: BionicPRO regional office
+      LDAP_DOMAIN: example.com
+      LDAP_ADMIN_PASSWORD: ${LDAP_ADMIN_PASSWORD:?Run scripts/prepare-local.py}
+      LDAP_TLS: "true"
+      LDAP_TLS_CRT_FILENAME: localhost.crt
+      LDAP_TLS_KEY_FILENAME: localhost.key
+      LDAP_TLS_CA_CRT_FILENAME: localhost.crt
+      LDAP_TLS_VERIFY_CLIENT: never
+    volumes:
+      - ./ldap/config.ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom/50-users.ldif:ro
+      - ./.local/tls:/container/service/slapd/assets/certs:ro
+      - ldap-data:/var/lib/ldap
+      - ldap-config:/etc/ldap/slapd.d
+    networks: [identity]
+  keycloak:
+    build: ./keycloak
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?Run scripts/prepare-local.py}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
+      KC_HOSTNAME: ${PUBLIC_ORIGIN:-https://localhost:3443}/identity
+      KC_HTTP_ENABLED: "true"
+      KC_HTTP_RELATIVE_PATH: /identity
+      KC_PROXY_HEADERS: xforwarded
+      KC_TRUSTSTORE_PATHS: /opt/keycloak/conf/truststores/localhost.crt
+      AUTH_CLIENT_SECRET: ${AUTH_CLIENT_SECRET:?Run scripts/prepare-local.py}
+      LDAP_ADMIN_PASSWORD: ${LDAP_ADMIN_PASSWORD}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-https://localhost:3443}
+      YANDEX_ENABLED: ${YANDEX_ENABLED:-false}
+      YANDEX_CLIENT_ID: ${YANDEX_CLIENT_ID:-not-configured}
+      YANDEX_CLIENT_SECRET: ${YANDEX_CLIENT_SECRET:-not-configured}
+    command: [start, --import-realm]
+    healthcheck:
+      test: [CMD-SHELL, "bash -c 'echo > /dev/tcp/127.0.0.1/8080'"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+      start_period: 20s
+    volumes:
+      - ./keycloak/keycloak-results-export.json:/opt/keycloak/data/import/reports-realm-realm.json:ro
+      - ./.local/tls/localhost.crt:/opt/keycloak/conf/truststores/localhost.crt:ro
+    depends_on:
+      keycloak_db:
+        condition: service_healthy
+      ldap:
+        condition: service_started
+    networks: [edge, identity]
+  bionicpro-auth:
+    build: ./bionicpro-auth
+    environment:
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-https://localhost:3443}
+      AUTH_CLIENT_SECRET: ${AUTH_CLIENT_SECRET}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?Run scripts/prepare-local.py}
+      PROFILE_DATABASE_URL: postgresql://profiles:${PROFILE_DB_PASSWORD}@profile_db:5432/profiles
+      YANDEX_ENABLED: ${YANDEX_ENABLED:-false}
+      REPORTS_URL: http://reports-api:8080
+    depends_on:
+      profile_db:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [edge, profiles, reports]
+  frontend:
+    build: ./frontend
+    networks: [edge]
+  gateway:
+    image: nginx:1.28.0-alpine
+    ports:
+      - "127.0.0.1:3443:443"
+    volumes:
+      - ./nginx/gateway.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./.local/tls:/etc/nginx/tls:ro
+    depends_on:
+      frontend:
+        condition: service_started
+      bionicpro-auth:
+        condition: service_started
+      keycloak:
+        condition: service_healthy
+    networks: [edge]
+
+volumes:
+  keycloak-data:
+  profile-data:
+  ldap-data:
+  ldap-config:
+  crm-data:
+  telemetry-data:
+  clickhouse-data:
+  airflow-data:
+  airflow-logs:
+  reports-s3:
+  reports-cdn-cache:
+  kafka-data:
+networks:
+  cdc:
+    internal: true
+  crm-source:
+    internal: true
+  telemetry-source:
+    internal: true
+  edge:
+  identity:
+    internal: true
+  profiles:
+    internal: true
+  reports:
+    internal: true
+  analytics:
+    internal: true
+  storage:
+    internal: true

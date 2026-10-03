@@ -1,0 +1,21 @@
+<clickhouse>
+  <profiles>
+    <reports_readonly>
+      <readonly>1</readonly>
+      <max_memory_usage>268435456</max_memory_usage>
+      <max_execution_time>8</max_execution_time>
+      <max_result_rows>10000</max_result_rows>
+      <result_overflow_mode>throw</result_overflow_mode>
+      <output_format_json_quote_64bit_integers>0</output_format_json_quote_64bit_integers>
+    </reports_readonly>
+  </profiles>
+  <users>
+    <reports_api>
+      <password from_env="CLICKHOUSE_REPORTS_PASSWORD"/>
+      <networks><ip>::/0</ip></networks>
+      <profile>reports_readonly</profile>
+      <quota>default</quota>
+      <allow_databases><database>reporting</database></allow_databases>
+    </reports_api>
+  </users>
+</clickhouse>
